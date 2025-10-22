@@ -7,18 +7,20 @@ Simple Network Packet Sniffer
     sudo python3 sniffer.py --proto tcp --port 80 --pcap out.pcap
 """
 import signal
+import socket
+import struct
+import argparse
+import os
+import sys
+import ctypes
+from datetime import datetime
+
 running = True
 
 def signal_handler(signum, frame):
     global running
     print("\nStopping sniffer...")
     running = False
-import socket
-import struct
-import argparse
-import os
-import sys
-from datetime import datetime
 
 def parse_ethernet_header(data):
     dest_mac, src_mac, proto = struct.unpack('!6s6sH', data[:14])
@@ -67,31 +69,59 @@ def write_pcap_packet(pcap_file, packet_data):
     pcap_file.write(packet_data)
 
 def main():
+    # Check for administrator privileges
+    if os.name == 'nt' and not ctypes.windll.shell32.IsUserAnAdmin():
+        print("This script requires administrator privileges. Please run as administrator.")
+        sys.exit(1)
+
     parser = argparse.ArgumentParser(description="Simple Network Packet Sniffer")
     parser.add_argument('--proto', type=str, help='Filter by protocol (tcp/udp/icmp)', default=None)
     parser.add_argument('--port', type=int, help='Filter by port number', default=None)
     parser.add_argument('--pcap', type=str, help='Output pcap file', default=None)
     args = parser.parse_args()
 
-    if os.name == 'nt':
-        socket_protocol = socket.IPPROTO_IP
-        sniffer = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket_protocol)
-        # On Windows, we need to set up promiscuous mode
-        sniffer.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
-        sniffer.bind(('0.0.0.0', 0))  # Listen on all available interfaces
-        try:
-            sniffer.ioctl(socket.SIO_RCVALL, socket.RCVALL_ON)
-        except:
-            print("Failed to set promiscuous mode. Make sure you're running as Administrator.")
-            sys.exit(1)
-    else:
-        socket_protocol = socket.ntohs(0x0003)
-        sniffer = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket_protocol)
-        try:
-            sniffer.bind(('0.0.0.0', 0))
-        except Exception as e:
-            print(f"Socket could not be created. Error: {e}")
-            sys.exit(1) 
+    try:
+        if os.name == 'nt':
+            socket_protocol = socket.IPPROTO_IP
+            sniffer = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket_protocol)
+            print("Created raw socket successfully")
+            
+            # On Windows, we need to set up promiscuous mode
+            try:
+                sniffer.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+                print("Set IP_HDRINCL option successfully")
+            except Exception as e:
+                print(f"Failed to set IP_HDRINCL: {e}")
+                sys.exit(1)
+
+            # Bind to the host
+            try:
+                host = socket.gethostbyname(socket.gethostname())
+                sniffer.bind((host, 0))
+                print(f"Bound to interface: {host}")
+            except Exception as e:
+                print(f"Failed to bind: {e}")
+                sys.exit(1)
+
+            # Enable promiscuous mode
+            try:
+                sniffer.ioctl(socket.SIO_RCVALL, socket.RCVALL_ON)
+                print("Enabled promiscuous mode successfully")
+            except Exception as e:
+                print(f"Failed to set promiscuous mode: {e}")
+                print("Make sure you're running as Administrator.")
+                sys.exit(1)
+        else:
+            socket_protocol = socket.ntohs(0x0003)
+            sniffer = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket_protocol)
+            try:
+                sniffer.bind(('0.0.0.0', 0))
+            except Exception as e:
+                print(f"Socket could not be created. Error: {e}")
+                sys.exit(1)
+    except Exception as e:
+        print(f"Failed to initialize sniffer: {e}")
+        sys.exit(1) 
 
    
 
