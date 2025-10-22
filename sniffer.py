@@ -68,6 +68,13 @@ def write_pcap_packet(pcap_file, packet_data):
                                 orig_len))
     pcap_file.write(packet_data)
 
+def validate_ip(ip):
+    try:
+        socket.inet_aton(ip)
+        return True
+    except socket.error:
+        return False
+
 def main():
     # Check for administrator privileges
     if os.name == 'nt' and not ctypes.windll.shell32.IsUserAnAdmin():
@@ -78,7 +85,12 @@ def main():
     parser.add_argument('--proto', type=str, help='Filter by protocol (tcp/udp/icmp)', default=None)
     parser.add_argument('--port', type=int, help='Filter by port number', default=None)
     parser.add_argument('--pcap', type=str, help='Output pcap file', default=None)
+    parser.add_argument('--ip', type=str, help='IP address to sniff (e.g., 192.168.1.100)', default=None)
     args = parser.parse_args()
+
+    if args.ip and not validate_ip(args.ip):
+        print(f"Invalid IP address format: {args.ip}")
+        sys.exit(1)
 
     try:
         if os.name == 'nt':
@@ -144,6 +156,10 @@ def main():
 
             if eth_proto == 8:  # IP Packet
                 version, header_length, ttl, proto, src_ip, dest_ip, data = parse_ip_header(data)
+
+                # Filter by IP if specified
+                if args.ip and src_ip != args.ip and dest_ip != args.ip:
+                    continue
 
                 if args.proto and ((args.proto.lower() == 'tcp' and proto != 6) or
                                    (args.proto.lower() == 'udp' and proto != 17) or
