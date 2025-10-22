@@ -6,6 +6,13 @@ Simple Network Packet Sniffer
     sudo python3 sniffer.py
     sudo python3 sniffer.py --proto tcp --port 80 --pcap out.pcap
 """
+import signal
+running = True
+
+def signal_handler(signum, frame):
+    global running
+    print("\nStopping sniffer...")
+    running = False
 import socket
 import struct
 import argparse
@@ -69,18 +76,22 @@ def main():
     if os.name == 'nt':
         socket_protocol = socket.IPPROTO_IP
         sniffer = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket_protocol)
+        # On Windows, we need to set up promiscuous mode
+        sniffer.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+        sniffer.bind(('0.0.0.0', 0))  # Listen on all available interfaces
+        try:
+            sniffer.ioctl(socket.SIO_RCVALL, socket.RCVALL_ON)
+        except:
+            print("Failed to set promiscuous mode. Make sure you're running as Administrator.")
+            sys.exit(1)
     else:
         socket_protocol = socket.ntohs(0x0003)
         sniffer = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket_protocol)
-
-    try:
-        sniffer.bind((socket.gethostname(), 0))
-    except Exception as e:
-        print(f"Socket could not be created. Error: {e}")
-        sys.exit()
-    sniffer.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
-    if os.name == 'nt':
-        sniffer.ioctl(socket.SIO_RCVALL, socket.RCVALL_ON)
+        try:
+            sniffer.bind(('0.0.0.0', 0))
+        except Exception as e:
+            print(f"Socket could not be created. Error: {e}")
+            sys.exit(1) 
 
    
 
@@ -89,9 +100,15 @@ def main():
         pcap_file = open(args.pcap, 'wb')
         write_pcap_global_header(pcap_file)
 
+    # Set up signal handler for graceful exit
+    signal.signal(signal.SIGINT, signal_handler)
     print("Sniffer started... Press Ctrl+C to stop.")
+    
+    global running
+    running = True
+    
     try:
-        while True:
+        while running:
             raw_data, addr = sniffer.recvfrom(65535)
             eth_dest, eth_src, eth_proto, data = parse_ethernet_header(raw_data)
 
