@@ -68,14 +68,21 @@ def main():
 
     if os.name == 'nt':
         socket_protocol = socket.IPPROTO_IP
+        sniffer = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket_protocol)
     else:
         socket_protocol = socket.ntohs(0x0003)
+        sniffer = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket_protocol)
 
     try:
-        sniffer = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket_protocol)
+        sniffer.bind((socket.gethostname(), 0))
     except Exception as e:
         print(f"Socket could not be created. Error: {e}")
         sys.exit()
+    sniffer.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+    if os.name == 'nt':
+        sniffer.ioctl(socket.SIO_RCVALL, socket.RCVALL_ON)
+
+   
 
     pcap_file = None
     if args.pcap:
