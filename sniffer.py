@@ -34,10 +34,12 @@ import argparse
 import ctypes
 import logging
 import os
+import psutil
 import signal
 import socket
 import struct
 import sys
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -85,10 +87,13 @@ class SecurityError(Exception):
     pass
 
 @contextmanager
-def create_sniffer_socket():
+def create_sniffer_socket(args: argparse.Namespace):
     """
     Create and configure a raw socket for packet sniffing.
     
+    Args:
+        args: Command line arguments
+        
     Yields:
         socket.socket: Configured raw socket for packet sniffing
         
@@ -102,32 +107,40 @@ def create_sniffer_socket():
             if not ctypes.windll.shell32.IsUserAnAdmin():
                 raise SecurityError("Administrator privileges required on Windows")
             
-            # Get all network interfaces
-            import psutil
-            valid_ips = []
-            
-            # Get all network interfaces using psutil
-            for iface, addrs in psutil.net_if_addrs().items():
-                for addr in addrs:
-                    # Get only IPv4 addresses
-                    if addr.family == socket.AF_INET:
-                        ip = addr.address
-                        if not ip.startswith('127.'):  # Skip loopback
-                            valid_ips.append((iface, ip))
+            valid_ips = get_network_interfaces()
             
             if not valid_ips:
                 raise SecurityError("No valid network interfaces found")
-                
-            # Sort by interface name
-            valid_ips.sort()
             
-            # Print available interfaces
-            logger.info("Available network interfaces:")
-            for i, (iface, ip) in enumerate(valid_ips):
-                logger.info(f"{i+1}. {iface}: {ip}")
+            # Select interface based on command line argument
+            if args.interface:
+                # Try to match by interface name first
+                matching_interfaces = [
+                    (iface, ip) for iface, ip in valid_ips 
+                    if iface.lower() == args.interface.lower()
+                ]
                 
-            # Use first non-loopback interface by default
-            host = valid_ips[0][1]
+                if not matching_interfaces:
+                    # Try by number
+                    try:
+                        index = int(args.interface) - 1
+                        if 0 <= index < len(valid_ips):
+                            matching_interfaces = [valid_ips[index]]
+                    except ValueError:
+                        pass
+                
+                if not matching_interfaces:
+                    raise SecurityError(
+                        f"Interface '{args.interface}' not found. "
+                        "Use one of the listed interface names or numbers."
+                    )
+                
+                host = matching_interfaces[0][1]
+            else:
+                # Use first non-loopback interface by default
+                host = valid_ips[0][1]
+                
+            logger.info(f"Using interface with IP: {host}")
             logger.info(f"Using interface: {host}")
             
             sniffer = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_IP)
@@ -301,14 +314,39 @@ def validate_ip(ip: str) -> bool:
     except socket.error:
         return False
 
+def get_network_interfaces() -> list:
+    """Get list of available network interfaces."""
+    valid_ips = []
+    
+    # Get all network interfaces using psutil
+    for iface, addrs in psutil.net_if_addrs().items():
+        for addr in addrs:
+            # Get only IPv4 addresses
+            if addr.family == socket.AF_INET:
+                ip = addr.address
+                if not ip.startswith('127.'):  # Skip loopback
+                    valid_ips.append((iface, ip))
+    
+    return sorted(valid_ips)
+
 def parse_args() -> argparse.Namespace:
     """Parse command line arguments."""
+    interfaces = get_network_interfaces()
+    
     parser = argparse.ArgumentParser(description="Advanced Network Packet Sniffer")
     parser.add_argument('--proto', type=str, help='Filter by protocol (tcp/udp/icmp)')
     parser.add_argument('--port', type=int, help='Filter by port number')
     parser.add_argument('--pcap', type=str, help='Output pcap file')
     parser.add_argument('--ip', type=str, help='Filter by IP address')
     parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose output')
+    parser.add_argument('--interface', '-i', type=str,
+                      help='Network interface to use for capture. Use interface name or number from the list.')
+    
+    # Print available interfaces before parsing
+    print("\nAvailable network interfaces:")
+    for i, (iface, ip) in enumerate(interfaces, 1):
+        print(f"{i}. {iface}: {ip}")
+    print()
     
     args = parser.parse_args()
     
@@ -317,33 +355,57 @@ def parse_args() -> argparse.Namespace:
     
     if args.verbose:
         logger.setLevel(logging.DEBUG)
-        
+    
     return args
+
+def check_for_exit(running: list) -> None:
+    """Thread function to check for 'exit' command."""
+    while running[0]:
+        try:
+            if input().strip().lower() == 'exit':
+                logger.info("\nExit command received. Stopping sniffer...")
+                running[0] = False
+                break
+        except EOFError:
+            # This can happen when running with redirected input
+            continue
 
 def main():
     """Main program entry point."""
     args = parse_args()
     packet_filter = PacketFilter(args.proto, args.port, args.ip)
     pcap_writer = None
-    running = True
+    running = [True]  # Using list for mutable state across threads
 
     def signal_handler(signum, frame):
-        nonlocal running
+        running[0] = False
         logger.info("\nStopping sniffer...")
-        running = False
 
     signal.signal(signal.SIGINT, signal_handler)
+    
+    # Start thread to check for exit command
+    exit_thread = threading.Thread(target=check_for_exit, args=(running,), daemon=True)
+    exit_thread.start()
     
     try:
         if args.pcap:
             pcap_writer = PCAPWriter(args.pcap)
             
-        with create_sniffer_socket() as sniffer:
-            logger.info("Sniffer started... Press Ctrl+C to stop.")
+        with create_sniffer_socket(args) as sniffer:
+            logger.info("Sniffer started... Type 'exit' or press Ctrl+C to stop.")
             
-            while running:
-                raw_data, addr = sniffer.recvfrom(PACKET_SIZE)
-                
+            # Set a timeout so we can check the running flag
+            sniffer.settimeout(1.0)
+            
+            while running[0]:
+                try:
+                    raw_data, addr = sniffer.recvfrom(PACKET_SIZE)
+                except socket.timeout:
+                    continue
+                except socket.error as e:
+                    logger.error(f"Socket error: {e}")
+                    break
+                    
                 try:
                     eth_dest, eth_src, eth_proto, data = parse_ethernet_header(raw_data)
                     
