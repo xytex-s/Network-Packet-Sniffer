@@ -318,16 +318,41 @@ def get_network_interfaces() -> list:
     """Get list of available network interfaces."""
     valid_ips = []
     
-    # Get all network interfaces using psutil
-    for iface, addrs in psutil.net_if_addrs().items():
-        for addr in addrs:
-            # Get only IPv4 addresses
-            if addr.family == socket.AF_INET:
-                ip = addr.address
-                if not ip.startswith('127.'):  # Skip loopback
-                    valid_ips.append((iface, ip))
-    
-    return sorted(valid_ips)
+    logger.debug("Retrieving network interfaces...")
+    try:
+        # Get all network interfaces using psutil
+        interfaces = psutil.net_if_addrs()
+        logger.debug(f"Found {len(interfaces)} total interfaces")
+        
+        for iface, addrs in interfaces.items():
+            logger.debug(f"Checking interface: {iface}")
+            for addr in addrs:
+                # Get only IPv4 addresses that are active
+                if (addr.family == socket.AF_INET and 
+                    not addr.address.startswith('127.') and  # Skip loopback
+                    not addr.address.startswith('169.254.')):  # Skip link-local
+                    try:
+                        # Try to create a test socket to verify the interface is usable
+                        test_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                        test_socket.bind((addr.address, 0))
+                        test_socket.close()
+                        
+                        logger.debug(f"Found valid interface: {iface} ({addr.address})")
+                        valid_ips.append((iface, addr.address))
+                    except socket.error:
+                        logger.debug(f"Interface {iface} ({addr.address}) is not usable")
+                        continue
+        
+        if not valid_ips:
+            logger.error("No usable network interfaces found")
+            logger.error("Please ensure at least one network interface is connected and has a valid IP address")
+            raise SecurityError("No usable network interfaces found")
+            
+        logger.debug(f"Found {len(valid_ips)} valid interfaces")
+        return sorted(valid_ips)
+    except Exception as e:
+        logger.exception("Error retrieving network interfaces:")
+        raise
 
 def parse_args() -> argparse.Namespace:
     """Parse command line arguments."""
@@ -407,10 +432,9 @@ def main():
                     break
                     
                 try:
-                    eth_dest, eth_src, eth_proto, data = parse_ethernet_header(raw_data)
-                    
-                    if eth_proto == 8:  # IP
-                        version, header_length, ttl, proto, src_ip, dest_ip, data = parse_ip_header(data)
+                    if os.name == 'nt':  # Windows
+                        # Windows raw sockets receive IP packets directly
+                        version, header_length, ttl, proto, src_ip, dest_ip, data = parse_ip_header(raw_data)
                         
                         if proto == 6:  # TCP
                             src_port, dest_port, sequence, acknowledgment, offset, data = parse_tcp_header(data)
@@ -424,10 +448,29 @@ def main():
                                 
                         elif packet_filter.matches(proto, 0, 0, src_ip, dest_ip):
                             logger.info(f"Other IP: {src_ip} -> {dest_ip} (Protocol: {proto})")
-                            
                     else:
-                        logger.debug(f"Non-IP Packet: Ethertype {eth_proto}")
+                        # Unix-like systems parse Ethernet frame first
+                        eth_dest, eth_src, eth_proto, data = parse_ethernet_header(raw_data)
                         
+                        if eth_proto == 8:  # IP
+                            version, header_length, ttl, proto, src_ip, dest_ip, data = parse_ip_header(data)
+                            
+                            if proto == 6:  # TCP
+                                src_port, dest_port, sequence, acknowledgment, offset, data = parse_tcp_header(data)
+                                if packet_filter.matches(proto, src_port, dest_port, src_ip, dest_ip):
+                                    logger.info(f"TCP: {src_ip}:{src_port} -> {dest_ip}:{dest_port}")
+                                    
+                            elif proto == 17:  # UDP
+                                src_port, dest_port, size, data = parse_udp_header(data)
+                                if packet_filter.matches(proto, src_port, dest_port, src_ip, dest_ip):
+                                    logger.info(f"UDP: {src_ip}:{src_port} -> {dest_ip}:{dest_port}")
+                                    
+                            elif packet_filter.matches(proto, 0, 0, src_ip, dest_ip):
+                                logger.info(f"Other IP: {src_ip} -> {dest_ip} (Protocol: {proto})")
+                                
+                        else:
+                            logger.debug(f"Non-IP Packet: Ethertype {eth_proto}")
+                            
                     if pcap_writer:
                         pcap_writer.write_packet(raw_data)
                         
@@ -449,4 +492,17 @@ def main():
         logger.info("Sniffer stopped.")
 
 if __name__ == "__main__":
-    main()
+    try:
+        # Set up logging to file in addition to console
+        file_handler = logging.FileHandler('sniffer_debug.log')
+        file_handler.setLevel(logging.DEBUG)
+        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+        
+        logger.debug("Starting sniffer...")
+        main()
+    except Exception as e:
+        logger.exception("Fatal error occurred:")
+        # Keep window open to read error
+        input("Press Enter to exit...")
