@@ -1,195 +1,363 @@
+#!/usr/bin/env python3
 """
-Simple Network Packet Sniffer
-- Run as root/Administrator
-- Works on Linux/macOS (AF_PACKET) and attempts a Windows capture using raw sockets
-- Usage examples:
+Advanced Network Packet Sniffer
+------------------------------
+
+A robust network packet sniffer that captures and analyzes network traffic in real-time.
+Supports packet filtering, PCAP file output, and cross-platform operation.
+
+Features:
+- Cross-platform support (Linux/macOS/Windows)
+- Protocol filtering (TCP/UDP/ICMP)
+- Port filtering
+- IP address filtering
+- PCAP file output
+- Promiscuous mode support
+- Graceful shutdown handling
+
+Security features:
+- Privilege validation
+- Input validation
+- Error handling
+- Resource cleanup
+
+Usage examples:
     sudo python3 sniffer.py
     sudo python3 sniffer.py --proto tcp --port 80 --pcap out.pcap
+    sudo python3 sniffer.py --ip 192.168.1.100
+
+Author: xytex-s
+License: MIT
 """
+
+import argparse
+import ctypes
+import logging
+import os
 import signal
 import socket
 import struct
-import argparse
-import os
 import sys
-import ctypes
+from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime
+from typing import Optional, Tuple, Union, BinaryIO
 
-running = True
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
 
-def signal_handler(signum, frame):
-    global running
-    print("\nStopping sniffer...")
-    running = False
+# Constants
+PACKET_SIZE = 65535
+ETHERNET_HEADER_LENGTH = 14
+IP_HEADER_LENGTH = 20
+TCP_HEADER_LENGTH = 20
+UDP_HEADER_LENGTH = 8
 
-def parse_ethernet_header(data):
-    dest_mac, src_mac, proto = struct.unpack('!6s6sH', data[:14])
-    return get_mac_addr(dest_mac), get_mac_addr(src_mac), socket.htons(proto), data[14:]
+@dataclass
+class PacketFilter:
+    """Configuration for packet filtering."""
+    protocol: Optional[str] = None
+    port: Optional[int] = None
+    ip: Optional[str] = None
 
-def get_mac_addr(bytes_addr):
+    def matches(self, proto: int, src_port: int, dest_port: int, src_ip: str, dest_ip: str) -> bool:
+        """Check if a packet matches the filter criteria."""
+        if self.protocol:
+            proto_map = {'tcp': 6, 'udp': 17, 'icmp': 1}
+            if proto != proto_map.get(self.protocol.lower()):
+                return False
+        
+        if self.port and src_port != self.port and dest_port != self.port:
+            return False
+            
+        if self.ip and src_ip != self.ip and dest_ip != self.ip:
+            return False
+            
+        return True
+
+class SecurityError(Exception):
+    """Custom exception for security-related errors."""
+    pass
+
+@contextmanager
+def create_sniffer_socket():
+    """
+    Create and configure a raw socket for packet sniffing.
+    
+    Yields:
+        socket.socket: Configured raw socket for packet sniffing
+        
+    Raises:
+        SecurityError: If privileges are insufficient
+        OSError: If socket creation fails
+    """
+    sniffer = None
+    try:
+        if os.name == 'nt':  # Windows
+            if not ctypes.windll.shell32.IsUserAnAdmin():
+                raise SecurityError("Administrator privileges required on Windows")
+            
+            sniffer = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_IP)
+            host = socket.gethostbyname(socket.gethostname())
+            sniffer.bind((host, 0))
+            sniffer.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+            sniffer.ioctl(socket.SIO_RCVALL, socket.RCVALL_ON)
+            logger.info(f"Windows sniffer bound to interface: {host}")
+            
+        else:  # Unix-like systems
+            if os.geteuid() != 0:
+                raise SecurityError("Root privileges required on Unix-like systems")
+                
+            sniffer = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.ntohs(0x0003))
+            sniffer.bind(('0.0.0.0', 0))
+            logger.info("Unix-like sniffer initialized in promiscuous mode")
+            
+        yield sniffer
+        
+    except socket.error as e:
+        raise OSError(f"Failed to create raw socket: {e}")
+        
+    finally:
+        if sniffer:
+            try:
+                if os.name == 'nt':
+                    sniffer.ioctl(socket.SIO_RCVALL, socket.RCVALL_OFF)
+                sniffer.close()
+            except Exception as e:
+                logger.error(f"Error during socket cleanup: {e}")
+
+def parse_ethernet_header(data: bytes) -> Tuple[str, str, int, bytes]:
+    """
+    Parse Ethernet frame header.
+    
+    Args:
+        data: Raw packet data
+        
+    Returns:
+        Tuple containing destination MAC, source MAC, protocol, and remaining data
+    """
+    try:
+        dest_mac, src_mac, proto = struct.unpack('!6s6sH', data[:ETHERNET_HEADER_LENGTH])
+        return (
+            get_mac_addr(dest_mac),
+            get_mac_addr(src_mac),
+            socket.htons(proto),
+            data[ETHERNET_HEADER_LENGTH:]
+        )
+    except struct.error as e:
+        raise ValueError(f"Invalid Ethernet header format: {e}")
+
+def get_mac_addr(bytes_addr: bytes) -> str:
+    """Convert bytes to MAC address string."""
     return ':'.join(format(b, '02x') for b in bytes_addr)
 
-def parse_ip_header(data):
-    version_header_length = data[0]
-    version = version_header_length >> 4
-    header_length = (version_header_length & 0x0F) * 4
-    ttl, proto, src, target = struct.unpack('!8xBB2x4s4s', data[:20])
-    return version, header_length, ttl, proto, socket.inet_ntoa(src), socket.inet_ntoa(target), data[header_length:]
+def parse_ip_header(data: bytes) -> Tuple[int, int, int, int, str, str, bytes]:
+    """
+    Parse IP packet header.
+    
+    Args:
+        data: IP packet data
+        
+    Returns:
+        Tuple containing version, header length, TTL, protocol, source IP,
+        destination IP, and remaining data
+    """
+    try:
+        version_header_length = data[0]
+        version = version_header_length >> 4
+        header_length = (version_header_length & 0x0F) * 4
+        ttl, proto, src, target = struct.unpack('!8xBB2x4s4s', data[:IP_HEADER_LENGTH])
+        return (
+            version,
+            header_length,
+            ttl,
+            proto,
+            socket.inet_ntoa(src),
+            socket.inet_ntoa(target),
+            data[header_length:]
+        )
+    except (struct.error, IndexError) as e:
+        raise ValueError(f"Invalid IP header format: {e}")
 
-def parse_tcp_header(data):
-    (src_port, dest_port, sequence, acknowledgment, offset_reserved_flags) = struct.unpack('!HHLLH', data[:14])
-    offset = (offset_reserved_flags >> 12) * 4
-    return src_port, dest_port, sequence, acknowledgment, offset, data[offset:]
+def parse_tcp_header(data: bytes) -> Tuple[int, int, int, int, int, bytes]:
+    """
+    Parse TCP segment header.
+    
+    Args:
+        data: TCP segment data
+        
+    Returns:
+        Tuple containing source port, destination port, sequence number,
+        acknowledgment number, header length, and remaining data
+    """
+    try:
+        src_port, dest_port, sequence, acknowledgment, offset_reserved_flags = (
+            struct.unpack('!HHLLH', data[:TCP_HEADER_LENGTH])
+        )
+        offset = (offset_reserved_flags >> 12) * 4
+        return src_port, dest_port, sequence, acknowledgment, offset, data[offset:]
+    except struct.error as e:
+        raise ValueError(f"Invalid TCP header format: {e}")
 
-def parse_udp_header(data):
-    src_port, dest_port, size = struct.unpack('!HH2xH', data[:8])
-    return src_port, dest_port, size, data[8:]
+def parse_udp_header(data: bytes) -> Tuple[int, int, int, bytes]:
+    """
+    Parse UDP datagram header.
+    
+    Args:
+        data: UDP datagram data
+        
+    Returns:
+        Tuple containing source port, destination port, size, and remaining data
+    """
+    try:
+        src_port, dest_port, size = struct.unpack('!HH2xH', data[:UDP_HEADER_LENGTH])
+        return src_port, dest_port, size, data[UDP_HEADER_LENGTH:]
+    except struct.error as e:
+        raise ValueError(f"Invalid UDP header format: {e}")
 
-def write_pcap_global_header(pcap_file):
-    pcap_file.write(struct.pack('@ I H H i I I I ',
-                                0xa1b2c3d4,  # magic number
-                                2,           # version major
-                                4,           # version minor
-                                0,           # thiszone
-                                0,           # sigfigs
-                                65535,       # snaplen
-                                1))          # network (Ethernet)
+class PCAPWriter:
+    """Handle PCAP file writing operations."""
+    
+    def __init__(self, filename: str):
+        """Initialize PCAP writer with output file."""
+        self.file = open(filename, 'wb')
+        self._write_global_header()
+        
+    def _write_global_header(self):
+        """Write PCAP file global header."""
+        self.file.write(struct.pack('@ I H H i I I I',
+            0xa1b2c3d4,  # magic number
+            2,           # version major
+            4,           # version minor
+            0,           # thiszone
+            0,           # sigfigs
+            PACKET_SIZE, # snaplen
+            1))         # network (Ethernet)
+            
+    def write_packet(self, packet_data: bytes):
+        """Write a packet to the PCAP file."""
+        ts = datetime.now()
+        ts_sec = int(ts.timestamp())
+        ts_usec = int(ts.microsecond)
+        length = len(packet_data)
+        
+        self.file.write(struct.pack('@ I I I I',
+            ts_sec,
+            ts_usec,
+            length,
+            length))
+        self.file.write(packet_data)
+        
+    def close(self):
+        """Close the PCAP file."""
+        if self.file:
+            self.file.close()
 
-def write_pcap_packet(pcap_file, packet_data):
-    ts = datetime.now()
-    ts_sec = int(ts.timestamp())
-    ts_usec = int(ts.microsecond)
-    incl_len = len(packet_data)
-    orig_len = len(packet_data)
-    pcap_file.write(struct.pack('@ I I I I',
-                                ts_sec,
-                                ts_usec,
-                                incl_len,
-                                orig_len))
-    pcap_file.write(packet_data)
-
-def validate_ip(ip):
+def validate_ip(ip: str) -> bool:
+    """
+    Validate IP address format.
+    
+    Args:
+        ip: IP address string
+        
+    Returns:
+        bool: True if valid, False otherwise
+    """
     try:
         socket.inet_aton(ip)
         return True
     except socket.error:
         return False
 
-def main():
-    # Check for administrator privileges
-    if os.name == 'nt' and not ctypes.windll.shell32.IsUserAnAdmin():
-        print("This script requires administrator privileges. Please run as administrator.")
-        sys.exit(1)
-
-    parser = argparse.ArgumentParser(description="Simple Network Packet Sniffer")
-    parser.add_argument('--proto', type=str, help='Filter by protocol (tcp/udp/icmp)', default=None)
-    parser.add_argument('--port', type=int, help='Filter by port number', default=None)
-    parser.add_argument('--pcap', type=str, help='Output pcap file', default=None)
-    parser.add_argument('--ip', type=str, help='IP address to sniff (e.g., 192.168.1.100)', default=None)
+def parse_args() -> argparse.Namespace:
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(description="Advanced Network Packet Sniffer")
+    parser.add_argument('--proto', type=str, help='Filter by protocol (tcp/udp/icmp)')
+    parser.add_argument('--port', type=int, help='Filter by port number')
+    parser.add_argument('--pcap', type=str, help='Output pcap file')
+    parser.add_argument('--ip', type=str, help='Filter by IP address')
+    parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose output')
+    
     args = parser.parse_args()
-
+    
     if args.ip and not validate_ip(args.ip):
-        print(f"Invalid IP address format: {args.ip}")
-        sys.exit(1)
-
-    try:
-        if os.name == 'nt':
-            socket_protocol = socket.IPPROTO_IP
-            sniffer = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket_protocol)
-            print("Created raw socket successfully")
-            
-            # On Windows, we need to set up promiscuous mode
-            try:
-                sniffer.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
-                print("Set IP_HDRINCL option successfully")
-            except Exception as e:
-                print(f"Failed to set IP_HDRINCL: {e}")
-                sys.exit(1)
-
-            # Bind to the host
-            try:
-                host = socket.gethostbyname(socket.gethostname())
-                sniffer.bind((host, 0))
-                print(f"Bound to interface: {host}")
-            except Exception as e:
-                print(f"Failed to bind: {e}")
-                sys.exit(1)
-
-            # Enable promiscuous mode
-            try:
-                sniffer.ioctl(socket.SIO_RCVALL, socket.RCVALL_ON)
-                print("Enabled promiscuous mode successfully")
-            except Exception as e:
-                print(f"Failed to set promiscuous mode: {e}")
-                print("Make sure you're running as Administrator.")
-                sys.exit(1)
-        else:
-            socket_protocol = socket.ntohs(0x0003)
-            sniffer = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket_protocol)
-            try:
-                sniffer.bind(('0.0.0.0', 0))
-            except Exception as e:
-                print(f"Socket could not be created. Error: {e}")
-                sys.exit(1)
-    except Exception as e:
-        print(f"Failed to initialize sniffer: {e}")
-        sys.exit(1) 
-
-   
-
-    pcap_file = None
-    if args.pcap:
-        pcap_file = open(args.pcap, 'wb')
-        write_pcap_global_header(pcap_file)
-
-    # Set up signal handler for graceful exit
-    signal.signal(signal.SIGINT, signal_handler)
-    print("Sniffer started... Press Ctrl+C to stop.")
+        parser.error(f"Invalid IP address format: {args.ip}")
     
-    global running
+    if args.verbose:
+        logger.setLevel(logging.DEBUG)
+        
+    return args
+
+def main():
+    """Main program entry point."""
+    args = parse_args()
+    packet_filter = PacketFilter(args.proto, args.port, args.ip)
+    pcap_writer = None
     running = True
+
+    def signal_handler(signum, frame):
+        nonlocal running
+        logger.info("\nStopping sniffer...")
+        running = False
+
+    signal.signal(signal.SIGINT, signal_handler)
     
     try:
-        while running:
-            raw_data, addr = sniffer.recvfrom(65535)
-            eth_dest, eth_src, eth_proto, data = parse_ethernet_header(raw_data)
-
-            if eth_proto == 8:  # IP Packet
-                version, header_length, ttl, proto, src_ip, dest_ip, data = parse_ip_header(data)
-
-                # Filter by IP if specified
-                if args.ip and src_ip != args.ip and dest_ip != args.ip:
+        if args.pcap:
+            pcap_writer = PCAPWriter(args.pcap)
+            
+        with create_sniffer_socket() as sniffer:
+            logger.info("Sniffer started... Press Ctrl+C to stop.")
+            
+            while running:
+                raw_data, addr = sniffer.recvfrom(PACKET_SIZE)
+                
+                try:
+                    eth_dest, eth_src, eth_proto, data = parse_ethernet_header(raw_data)
+                    
+                    if eth_proto == 8:  # IP
+                        version, header_length, ttl, proto, src_ip, dest_ip, data = parse_ip_header(data)
+                        
+                        if proto == 6:  # TCP
+                            src_port, dest_port, sequence, acknowledgment, offset, data = parse_tcp_header(data)
+                            if packet_filter.matches(proto, src_port, dest_port, src_ip, dest_ip):
+                                logger.info(f"TCP: {src_ip}:{src_port} -> {dest_ip}:{dest_port}")
+                                
+                        elif proto == 17:  # UDP
+                            src_port, dest_port, size, data = parse_udp_header(data)
+                            if packet_filter.matches(proto, src_port, dest_port, src_ip, dest_ip):
+                                logger.info(f"UDP: {src_ip}:{src_port} -> {dest_ip}:{dest_port}")
+                                
+                        elif packet_filter.matches(proto, 0, 0, src_ip, dest_ip):
+                            logger.info(f"Other IP: {src_ip} -> {dest_ip} (Protocol: {proto})")
+                            
+                    else:
+                        logger.debug(f"Non-IP Packet: Ethertype {eth_proto}")
+                        
+                    if pcap_writer:
+                        pcap_writer.write_packet(raw_data)
+                        
+                except (ValueError, struct.error) as e:
+                    logger.error(f"Error parsing packet: {e}")
                     continue
-
-                if args.proto and ((args.proto.lower() == 'tcp' and proto != 6) or
-                                   (args.proto.lower() == 'udp' and proto != 17) or
-                                   (args.proto.lower() == 'icmp' and proto != 1)):
-                    continue
-
-                if proto == 6:  # TCP
-                    src_port, dest_port, sequence, acknowledgment, offset, data = parse_tcp_header(data)
-                    if args.port and src_port != args.port and dest_port != args.port:
-                        continue
-                    print(f"TCP Packet: {src_ip}:{src_port} -> {dest_ip}:{dest_port}")
-
-                elif proto == 17:  # UDP
-                    src_port, dest_port, size, data = parse_udp_header(data)
-                    if args.port and src_port != args.port and dest_port != args.port:
-                        continue
-                    print(f"UDP Packet: {src_ip}:{src_port} -> {dest_ip}:{dest_port}")
-
-                else:
-                    print(f"Other IP Packet: {src_ip} -> {dest_ip} (Protocol: {proto})")
-            else:
-                print(f"Non-IP Packet: Ethertype {eth_proto}")
-            if pcap_file:
-                write_pcap_packet(pcap_file, raw_data)
-    except KeyboardInterrupt:
-        print("\nSniffer stopped.")
+                    
+    except SecurityError as e:
+        logger.error(f"Security Error: {e}")
+        sys.exit(1)
+        
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        sys.exit(1)
+        
     finally:
-        if pcap_file:
-            pcap_file.close()
-        sniffer.close()
+        if pcap_writer:
+            pcap_writer.close()
+        logger.info("Sniffer stopped.")
 
 if __name__ == "__main__":
     main()
