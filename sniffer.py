@@ -266,30 +266,76 @@ def parse_tcp_header(data: bytes) -> Tuple[int, int, int, int, int, bytes]:
     except struct.error as e:
         raise ValueError(f"Invalid TCP header format: {e}")
 
-def analyze_packet_content(data: bytes) -> str:
+def analyze_packet_content(data: bytes, protocol: Optional[int] = None) -> str:
     """
     Analyze packet content to identify protocol and packet type.
-    """
-    # Check for common protocol signatures
-    if len(data) >= 2:
-        # Look at first few bytes for protocol identification
-        first_bytes = data[:4] if len(data) >= 4 else data
-        hex_bytes = ' '.join(f'{b:02x}' for b in first_bytes)
-        
-        # Common protocol signatures
-        if data[:2] == b'\xff\xff':
-            return f"Broadcast packet (0xFFFF header), first bytes: {hex_bytes}"
-        elif data[:2] == b'\x08\x00':
-            return f"IPv4 packet, first bytes: {hex_bytes}"
-        elif data[:2] == b'\x08\x06':
-            return f"ARP packet, first bytes: {hex_bytes}"
-        elif data[:2] == b'\x86\xdd':
-            return f"IPv6 packet, first bytes: {hex_bytes}"
-        elif data[:2] == b'\x80\x35':
-            return f"RARP packet, first bytes: {hex_bytes}"
     
-    # If no specific protocol identified, return generic info
-    return f"Unknown protocol, first bytes: {' '.join(f'{b:02x}' for b in data[:8])}"
+    Args:
+        data: Raw packet data
+        protocol: IP protocol number if known
+    """
+    # Helper function to format packet dump
+    def format_packet_dump(data: bytes, max_bytes: int = 16) -> str:
+        hex_dump = ' '.join(f'{b:02x}' for b in data[:max_bytes])
+        ascii_dump = ''.join(chr(b) if 32 <= b <= 126 else '.' for b in data[:max_bytes])
+        return f"[HEX: {hex_dump}] [ASCII: {ascii_dump}]"
+    
+    analysis = []
+    
+    # Check data length
+    data_len = len(data)
+    analysis.append(f"Packet length: {data_len} bytes")
+    
+    # If we know the protocol, check for specific protocol patterns
+    if protocol is not None:
+        if protocol == 6:  # TCP
+            if data_len < 20:
+                analysis.append(f"Truncated TCP packet (only {data_len} bytes)")
+            elif data_len == 14:
+                analysis.append("Likely TCP fragment or control packet")
+            flags = data[13] if data_len > 13 else 0
+            if flags:
+                flag_desc = []
+                if flags & 0x01: flag_desc.append("FIN")
+                if flags & 0x02: flag_desc.append("SYN")
+                if flags & 0x04: flag_desc.append("RST")
+                if flags & 0x08: flag_desc.append("PSH")
+                if flags & 0x10: flag_desc.append("ACK")
+                if flags & 0x20: flag_desc.append("URG")
+                if flag_desc:
+                    analysis.append(f"TCP Flags: {' '.join(flag_desc)}")
+                    
+        elif protocol == 17:  # UDP
+            if data_len < 8:
+                analysis.append(f"Truncated UDP packet (only {data_len} bytes)")
+            if data_len >= 8:
+                try:
+                    length = struct.unpack('!H', data[4:6])[0]
+                    analysis.append(f"UDP declared length: {length}")
+                except struct.error:
+                    pass
+    
+    # Check for common protocol signatures regardless of IP protocol
+    if data_len >= 2:
+        first_two = data[:2]
+        protocols = {
+            b'\xff\xff': "Broadcast",
+            b'\x08\x00': "IPv4",
+            b'\x08\x06': "ARP",
+            b'\x86\xdd': "IPv6",
+            b'\x80\x35': "RARP",
+            b'\x88\x08': "EILP",
+            b'\x88\x09': "STP",
+            b'\x88\x47': "MPLS",
+            b'\x89\x42': "VLAN"
+        }
+        if first_two in protocols:
+            analysis.append(f"Protocol signature: {protocols[first_two]}")
+    
+    # Add packet dump
+    analysis.append("Packet dump: " + format_packet_dump(data))
+    
+    return ' | '.join(analysis)
 
 def parse_udp_header(data: bytes) -> Tuple[int, int, int, bytes]:
     """
@@ -501,9 +547,6 @@ def main():
                 try:
                     if os.name == 'nt':  # Windows
                         # Windows raw sockets receive packets directly
-                        # First try to analyze it as a raw packet
-                        analysis = analyze_packet_content(raw_data)
-                        
                         try:
                             version, header_length, ttl, proto, src_ip, dest_ip, data = parse_ip_header(raw_data)
                             
@@ -513,7 +556,8 @@ def main():
                                     if packet_filter.matches(proto, src_port, dest_port, src_ip, dest_ip):
                                         logger.info(f"TCP: {src_ip}:{src_port} -> {dest_ip}:{dest_port}")
                                 except ValueError as e:
-                                    logger.info(f"Non-standard TCP packet from {src_ip}: {e}")
+                                    analysis = analyze_packet_content(data, proto)
+                                    logger.info(f"TCP packet analysis from {src_ip}: {analysis}")
                                     continue
                                     
                             elif proto == 17:  # UDP
@@ -522,18 +566,18 @@ def main():
                                     if packet_filter.matches(proto, src_port, dest_port, src_ip, dest_ip):
                                         logger.info(f"UDP: {src_ip}:{src_port} -> {dest_ip}:{dest_port}")
                                 except ValueError as e:
-                                    logger.info(f"Non-standard UDP packet from {src_ip}: {e}")
+                                    analysis = analyze_packet_content(data, proto)
+                                    logger.info(f"UDP packet analysis from {src_ip}: {analysis}")
                                     continue
                                     
                             elif packet_filter.matches(proto, 0, 0, src_ip, dest_ip):
-                                logger.info(f"Other IP: {src_ip} -> {dest_ip} (Protocol: {proto})")
+                                analysis = analyze_packet_content(data, proto)
+                                logger.info(f"Other IP ({proto}) from {src_ip} -> {dest_ip}: {analysis}")
                                 
                         except ValueError as e:
-                            # If we can't parse it as IP, log the raw packet analysis
-                            logger.info(f"Non-IP packet: {analysis}")
-                            if len(raw_data) >= 14:  # Minimum size for useful hex dump
-                                hex_dump = ' '.join(f'{b:02x}' for b in raw_data[:14])
-                                logger.debug(f"Packet hex dump (first 14 bytes): {hex_dump}")
+                            # If we can't parse it as IP, do a complete raw packet analysis
+                            analysis = analyze_packet_content(raw_data)
+                            logger.info(f"Raw packet analysis: {analysis}")
                             continue
                     else:
                         # Unix-like systems parse Ethernet frame first
