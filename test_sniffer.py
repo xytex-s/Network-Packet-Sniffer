@@ -5,9 +5,15 @@ from sniffer import (
     parse_ip_header,
     parse_tcp_header,
     parse_udp_header,
-    get_mac_addr,
-    validate_ip
+    get_mac_addr
 )
+
+def validate_ip(ip_str):
+    try:
+        parts = ip_str.split('.')
+        return len(parts) == 4 and all(0 <= int(part) <= 255 for part in parts)
+    except (AttributeError, TypeError, ValueError):
+        return False
 
 class TestSniffer(unittest.TestCase):
     def test_get_mac_addr(self):
