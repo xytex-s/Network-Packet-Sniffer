@@ -206,11 +206,22 @@ def parse_ip_header(data: bytes) -> Tuple[int, int, int, int, str, str, bytes]:
     Returns:
         Tuple containing version, header length, TTL, protocol, source IP,
         destination IP, and remaining data
+        
+    Raises:
+        ValueError: If data is too small or header format is invalid
     """
+    if len(data) < IP_HEADER_LENGTH:
+        raise ValueError(f"IP header too small: {len(data)} bytes")
+        
     try:
         version_header_length = data[0]
         version = version_header_length >> 4
         header_length = (version_header_length & 0x0F) * 4
+        
+        # Validate header length
+        if header_length < IP_HEADER_LENGTH or len(data) < header_length:
+            raise ValueError(f"Invalid IP header length: {header_length}")
+            
         ttl, proto, src, target = struct.unpack('!8xBB2x4s4s', data[:IP_HEADER_LENGTH])
         return (
             version,
@@ -234,15 +245,51 @@ def parse_tcp_header(data: bytes) -> Tuple[int, int, int, int, int, bytes]:
     Returns:
         Tuple containing source port, destination port, sequence number,
         acknowledgment number, header length, and remaining data
+        
+    Raises:
+        ValueError: If data is too small or header format is invalid
     """
+    if len(data) < TCP_HEADER_LENGTH:
+        raise ValueError(f"TCP header too small: {len(data)} bytes")
+        
     try:
         src_port, dest_port, sequence, acknowledgment, offset_reserved_flags = (
             struct.unpack('!HHLLH', data[:TCP_HEADER_LENGTH])
         )
         offset = (offset_reserved_flags >> 12) * 4
+        
+        # Validate offset size
+        if offset < TCP_HEADER_LENGTH or len(data) < offset:
+            raise ValueError(f"Invalid TCP header length: {offset}")
+            
         return src_port, dest_port, sequence, acknowledgment, offset, data[offset:]
     except struct.error as e:
         raise ValueError(f"Invalid TCP header format: {e}")
+
+def analyze_packet_content(data: bytes) -> str:
+    """
+    Analyze packet content to identify protocol and packet type.
+    """
+    # Check for common protocol signatures
+    if len(data) >= 2:
+        # Look at first few bytes for protocol identification
+        first_bytes = data[:4] if len(data) >= 4 else data
+        hex_bytes = ' '.join(f'{b:02x}' for b in first_bytes)
+        
+        # Common protocol signatures
+        if data[:2] == b'\xff\xff':
+            return f"Broadcast packet (0xFFFF header), first bytes: {hex_bytes}"
+        elif data[:2] == b'\x08\x00':
+            return f"IPv4 packet, first bytes: {hex_bytes}"
+        elif data[:2] == b'\x08\x06':
+            return f"ARP packet, first bytes: {hex_bytes}"
+        elif data[:2] == b'\x86\xdd':
+            return f"IPv6 packet, first bytes: {hex_bytes}"
+        elif data[:2] == b'\x80\x35':
+            return f"RARP packet, first bytes: {hex_bytes}"
+    
+    # If no specific protocol identified, return generic info
+    return f"Unknown protocol, first bytes: {' '.join(f'{b:02x}' for b in data[:8])}"
 
 def parse_udp_header(data: bytes) -> Tuple[int, int, int, bytes]:
     """
@@ -253,12 +300,32 @@ def parse_udp_header(data: bytes) -> Tuple[int, int, int, bytes]:
         
     Returns:
         Tuple containing source port, destination port, size, and remaining data
+        
+    Raises:
+        ValueError: If data is too small or header format is invalid
     """
+    if len(data) < UDP_HEADER_LENGTH:
+        raise ValueError(f"UDP header too small: {len(data)} bytes")
+        
     try:
-        src_port, dest_port, size = struct.unpack('!HH2xH', data[:UDP_HEADER_LENGTH])
-        return src_port, dest_port, size, data[UDP_HEADER_LENGTH:]
+        src_port, dest_port, length = struct.unpack('!HH2xH', data[:UDP_HEADER_LENGTH])
+        
+        # If we get a large length, try to analyze the packet content
+        if length > 65507:  # Max UDP datagram size (65535 - 20 IP header - 8 UDP header)
+            analysis = analyze_packet_content(data)
+            raise ValueError(f"Large packet detected ({length} bytes): {analysis}")
+            
+        # UDP length field includes the header (8 bytes) plus data
+        if length < UDP_HEADER_LENGTH:
+            raise ValueError(f"UDP length too small: {length} bytes")
+        if length > len(data):
+            raise ValueError(f"UDP length ({length}) larger than received data ({len(data)} bytes)")
+            
+        return src_port, dest_port, length, data[UDP_HEADER_LENGTH:length]
     except struct.error as e:
-        raise ValueError(f"Invalid UDP header format: {e}")
+        # Try to analyze the content if we can't parse it as UDP
+        analysis = analyze_packet_content(data)
+        raise ValueError(f"Not a UDP packet: {analysis}")
 
 class PCAPWriter:
     """Handle PCAP file writing operations."""
@@ -433,21 +500,41 @@ def main():
                     
                 try:
                     if os.name == 'nt':  # Windows
-                        # Windows raw sockets receive IP packets directly
-                        version, header_length, ttl, proto, src_ip, dest_ip, data = parse_ip_header(raw_data)
+                        # Windows raw sockets receive packets directly
+                        # First try to analyze it as a raw packet
+                        analysis = analyze_packet_content(raw_data)
                         
-                        if proto == 6:  # TCP
-                            src_port, dest_port, sequence, acknowledgment, offset, data = parse_tcp_header(data)
-                            if packet_filter.matches(proto, src_port, dest_port, src_ip, dest_ip):
-                                logger.info(f"TCP: {src_ip}:{src_port} -> {dest_ip}:{dest_port}")
+                        try:
+                            version, header_length, ttl, proto, src_ip, dest_ip, data = parse_ip_header(raw_data)
+                            
+                            if proto == 6:  # TCP
+                                try:
+                                    src_port, dest_port, sequence, acknowledgment, offset, data = parse_tcp_header(data)
+                                    if packet_filter.matches(proto, src_port, dest_port, src_ip, dest_ip):
+                                        logger.info(f"TCP: {src_ip}:{src_port} -> {dest_ip}:{dest_port}")
+                                except ValueError as e:
+                                    logger.info(f"Non-standard TCP packet from {src_ip}: {e}")
+                                    continue
+                                    
+                            elif proto == 17:  # UDP
+                                try:
+                                    src_port, dest_port, size, data = parse_udp_header(data)
+                                    if packet_filter.matches(proto, src_port, dest_port, src_ip, dest_ip):
+                                        logger.info(f"UDP: {src_ip}:{src_port} -> {dest_ip}:{dest_port}")
+                                except ValueError as e:
+                                    logger.info(f"Non-standard UDP packet from {src_ip}: {e}")
+                                    continue
+                                    
+                            elif packet_filter.matches(proto, 0, 0, src_ip, dest_ip):
+                                logger.info(f"Other IP: {src_ip} -> {dest_ip} (Protocol: {proto})")
                                 
-                        elif proto == 17:  # UDP
-                            src_port, dest_port, size, data = parse_udp_header(data)
-                            if packet_filter.matches(proto, src_port, dest_port, src_ip, dest_ip):
-                                logger.info(f"UDP: {src_ip}:{src_port} -> {dest_ip}:{dest_port}")
-                                
-                        elif packet_filter.matches(proto, 0, 0, src_ip, dest_ip):
-                            logger.info(f"Other IP: {src_ip} -> {dest_ip} (Protocol: {proto})")
+                        except ValueError as e:
+                            # If we can't parse it as IP, log the raw packet analysis
+                            logger.info(f"Non-IP packet: {analysis}")
+                            if len(raw_data) >= 14:  # Minimum size for useful hex dump
+                                hex_dump = ' '.join(f'{b:02x}' for b in raw_data[:14])
+                                logger.debug(f"Packet hex dump (first 14 bytes): {hex_dump}")
+                            continue
                     else:
                         # Unix-like systems parse Ethernet frame first
                         eth_dest, eth_src, eth_proto, data = parse_ethernet_header(raw_data)
