@@ -149,10 +149,3 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 ## Author
 
 xytex-s
-
-## Version History
-
-- 1.0.0: Initial release
-  - Basic packet capture
-  - Protocol filtering
-  - Cross-platform support
