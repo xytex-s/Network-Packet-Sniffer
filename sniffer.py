@@ -102,8 +102,35 @@ def create_sniffer_socket():
             if not ctypes.windll.shell32.IsUserAnAdmin():
                 raise SecurityError("Administrator privileges required on Windows")
             
+            # Get all network interfaces
+            import psutil
+            valid_ips = []
+            
+            # Get all network interfaces using psutil
+            for iface, addrs in psutil.net_if_addrs().items():
+                for addr in addrs:
+                    # Get only IPv4 addresses
+                    if addr.family == socket.AF_INET:
+                        ip = addr.address
+                        if not ip.startswith('127.'):  # Skip loopback
+                            valid_ips.append((iface, ip))
+            
+            if not valid_ips:
+                raise SecurityError("No valid network interfaces found")
+                
+            # Sort by interface name
+            valid_ips.sort()
+            
+            # Print available interfaces
+            logger.info("Available network interfaces:")
+            for i, (iface, ip) in enumerate(valid_ips):
+                logger.info(f"{i+1}. {iface}: {ip}")
+                
+            # Use first non-loopback interface by default
+            host = valid_ips[0][1]
+            logger.info(f"Using interface: {host}")
+            
             sniffer = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_IP)
-            host = socket.gethostbyname(socket.gethostname())
             sniffer.bind((host, 0))
             sniffer.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
             sniffer.ioctl(socket.SIO_RCVALL, socket.RCVALL_ON)
