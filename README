@@ -1,0 +1,21 @@
+"""
+Advanced Network Packet Sniffer
+------------------------------
+
+A robust network packet sniffer that captures and analyzes network traffic in real-time.
+Supports packet filtering, PCAP file output, and cross-platform operation.
+
+Features:
+- Cross-platform support (Linux/macOS/Windows)
+- Protocol filtering (TCP/UDP/ICMP)
+- Port filtering
+- IP address filtering
+- PCAP file output
+- Promiscuous mode support
+- Graceful shutdown handling
+
+Security features:
+- Privilege validation
+- Input validation
+- Error handling
+- Resource cleanup
